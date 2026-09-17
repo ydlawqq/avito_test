@@ -6,7 +6,6 @@ __pycache__/
 .pytest_cache/
 
 # Производные данные и артефакты
-data/
 artifacts/
 tmp/
 
