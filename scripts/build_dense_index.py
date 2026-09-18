@@ -88,7 +88,7 @@ def main() -> None:
             chunk_overlap=dcfg["chunk_overlap"],
             max_chunks=dcfg["max_chunks_per_item"],
         )
-        chunk_texts.extend(f"{dcfg['passage_prefix']}{c}" for c in chunks)
+        chunk_texts.extend(f"{c}" for c in chunks)
         chunk_item_ids.extend([row.item_id] * len(chunks))
     print(f"Всего чанков: {len(chunk_texts)}")
 
@@ -100,7 +100,6 @@ def main() -> None:
         batch_size=dcfg["batch_size"],
         normalize_embeddings=True,
         show_progress_bar=True,
-        max_length=dcfg["max_length"],
     )
     embeddings = np.asarray(embeddings, dtype="float32")
     print(f"Эмбеддинги: {embeddings.shape}")
