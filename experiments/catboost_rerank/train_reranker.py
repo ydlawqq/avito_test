@@ -118,6 +118,20 @@ def cat_columns(X: np.ndarray) -> np.ndarray:
     return np.array([ALL_FEATURES.index(c) for c in CAT_FEATURES], dtype=int)
 
 
+def to_frame(X: np.ndarray) -> pd.DataFrame:
+    """np-матрица признаков -> DataFrame: числовые float32, категориальные int64.
+
+    CatBoost принимает категориальные фичи только типа int/str: чистый
+    float-массив трактуется как «без категориальных», и Pool падает с
+    CatBoostError «data is numpy array of floating point numerical type...».
+    """
+    n_num = len(NUM_FEATURES)
+    df = pd.DataFrame(X[:, :n_num], columns=NUM_FEATURES, dtype=np.float32)
+    for k, name in enumerate(CAT_FEATURES):
+        df[name] = X[:, n_num + k].astype(np.int64)
+    return df
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
@@ -203,9 +217,8 @@ def main() -> None:
     print(f"Train: {X_train.shape[0]:,} строк, {int(y_train.sum()):,} положительных "
           f"({time.time() - t0:.0f} c)")
 
-    train_pool = Pool(data=X_train, label=y_train, group_id=g_train,
-                      feature_names=ALL_FEATURES,
-                      cat_features=[ALL_FEATURES.index(c) for c in CAT_FEATURES])
+    train_pool = Pool(data=to_frame(X_train), label=y_train, group_id=g_train,
+                      feature_names=ALL_FEATURES, cat_features=CAT_FEATURES)
 
     # ------------------------------------------------------------------ обучение
     if args.loss == "yetirank":
@@ -256,7 +269,7 @@ def main() -> None:
         if not feats:
             continue
         X = np.concatenate(feats)
-        cb = model.predict(X).reshape(-1)
+        cb = model.predict(to_frame(X)).reshape(-1)
         pos = 0
         for qrow, ids, scores in metas:
             k = len(ids)
