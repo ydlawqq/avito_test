@@ -51,30 +51,33 @@ from src.pipeline.common import artifacts_dir, load_config, load_items
 
 NUM_FEATURES = [
     "bm25_score", "bm25_rank", "bm25_rank_pct", "loc_match", "cat_match",
-    "q_title_overlap", "q_title_coverage", "title_len", "desc_len",
-    "query_len", "pool_size", "is_delivery",
+    "q_title_overlap", "q_title_coverage", "q_params_overlap", "q_params_coverage",
+    "title_len", "desc_len", "query_len", "pool_size", "is_delivery",
 ]
 CAT_FEATURES = ["microcat_id", "search_loc"]
 ALL_FEATURES = NUM_FEATURES + CAT_FEATURES
 
 
 def load_item_info(items: pd.DataFrame) -> dict:
-    """item_id -> (loc, cat, microcat, title_frozenset, title_len, desc_len)."""
+    """item_id -> (loc, cat, microcat, title_fs, title_len, desc_len,
+    params_fs, params_len)."""
     info: dict[str, tuple] = {}
     for row in tqdm(items.itertuples(), total=len(items), desc="Индексация корпуса"):
-        title = row.title_lem
-        if isinstance(title, str):
-            title = title.split()
-        desc = row.desc_lem
-        if isinstance(desc, str):
-            desc = desc.split()
+        def _toks(v):
+            if v is None:
+                return []
+            if isinstance(v, str):
+                return v.split()
+            return list(v)
+        title = _toks(row.title_lem)
+        desc = _toks(row.desc_lem)
+        params = _toks(row.params_lem)
         info[row.item_id] = (
             int(row.item_location_id) if row.item_location_id is not None else -1,
             int(row.item_category_id) if row.item_category_id is not None else -1,
             int(row.item_microcat_id) if row.item_microcat_id is not None else -1,
-            frozenset(title) if title is not None else frozenset(),
-            len(title) if title is not None else 0,
-            len(desc) if desc is not None else 0,
+            frozenset(title), len(title), len(desc),
+            frozenset(params), len(params),
         )
     return info
 
@@ -100,12 +103,14 @@ def build_features(
     X = np.empty((n, len(ALL_FEATURES)), dtype=np.float32)
     ranks = np.arange(n, dtype=np.float32)
     for j, iid in enumerate(ids):
-        loc, cat, micro, tset, tlen, dlen = item_info[iid]
+        loc, cat, micro, tset, tlen, dlen, pset, plen = item_info[iid]
         ov = len(qset & tset) if tset else 0
+        pov = len(qset & pset) if pset else 0
         X[j] = (
             bm25_scores[j], ranks[j], ranks[j] / n,
             float(loc == q_loc), float(cat == q_cat),
             ov, ov / qlen,
+            pov, (pov / plen) if plen else 0.0,
             tlen, dlen,
             qlen, n, delivery,
             micro, q_loc if q_loc >= 0 else -1.0,
@@ -132,6 +137,13 @@ def to_frame(X: np.ndarray) -> pd.DataFrame:
     return df
 
 
+def _ranks(order: np.ndarray) -> np.ndarray:
+    """order — best-first перестановка; вернуть rank[doc] (1..N)."""
+    r = np.empty(len(order), dtype=np.float64)
+    r[order] = np.arange(1, len(order) + 1)
+    return r
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
@@ -152,6 +164,11 @@ def main() -> None:
                         help="сколько лучших по CatBoost пропускать в финал")
     parser.add_argument("--eval-chunk", type=int, default=40,
                         help="сколько eval-сессий скорим одним батчем")
+    parser.add_argument("--train-from", default=None,
+                        help="raw train.parquet: обучаться на ВСЕХ его сессиях "
+                             "(eval-сессии валидации исключаются)")
+    parser.add_argument("--fusion-weights", default="1,2,4",
+                        help="веса dense-стороной RRF внутри cb-топа")
     parser.add_argument("--model-out", default=str(Path(__file__).parent / "model.cb"))
     args = parser.parse_args()
     if args.pilot:
@@ -180,6 +197,14 @@ def main() -> None:
     eval_val = validation.iloc[n_train:]
     if args.pilot:
         eval_val = eval_val.head(150)
+    if args.train_from:
+        from src.evaluation.validation import build_validation
+        big = build_validation(args.train_from,
+                               artifacts / "items_processed.parquet", size=10_000_000)
+        eval_ids = set(eval_val["query_id"])
+        train_val = big[~big["query_id"].isin(eval_ids)].reset_index(drop=True)
+        print(f"Расширенный train: {args.train_from} -> {len(train_val)} сессий "
+              f"(eval-сессии исключены: {len(eval_ids)})")
     print(f"Сессий: train={len(train_val)}, eval={len(eval_val)} | "
           f"loss={args.loss}, neg_top={args.neg_top}, neg_rand={args.neg_rand}, "
           f"iters={args.iterations}, loc_boost={loc_boost}")
@@ -249,8 +274,10 @@ def main() -> None:
         print(f"(важность недоступна: {exc})")
 
     # ------------------------------------------------------------------- оценка
-    variants = ["bm25+loc@50", f"cb@50", f"cb@{args.cb_top}",
-                f"cb{args.cb_top}->loc@50", f"cb{args.cb_top}->cb*loc@50"]
+    fusion_ws = [float(x) for x in args.fusion_weights.split(",") if x.strip()]
+    variants = (["bm25+loc@50", "cb@50", f"cb@{args.cb_top}",
+                 f"cb{args.cb_top}->loc@50", f"cb{args.cb_top}->cb*loc@50"]
+                + [f"cb{args.cb_top}->rrf{w:g}@50" for w in fusion_ws])
     acc = {v: 0.0 for v in variants}
     n_eval = 0
     t0 = time.time()
@@ -302,6 +329,16 @@ def main() -> None:
             fin2 = np.argsort(-s[top] * (1.0 + loc_boost * match[top]), kind="stable")
             acc[f"cb{args.cb_top}->cb*loc@50"] += recall_at_k(
                 [ids[int(top[i])] for i in fin2], rel, k=50)
+            # fusion: RRF(cb_rank, bm25+loc_rank) ВНУТРИ cb топа — сигнал bm25
+            # не теряется, но cb может подтянуть свои находки
+            top_boosted = boosted[top]
+            r_bm = _ranks(np.argsort(-top_boosted, kind="stable"))
+            r_cb = _ranks(np.arange(len(top)))
+            for w in fusion_ws:
+                fused = 1.0 / (60.0 + r_cb) + w / (60.0 + r_bm)
+                o = np.argsort(-fused, kind="stable")
+                acc[f"cb{args.cb_top}->rrf{w:g}@50"] += recall_at_k(
+                    [ids[int(top[i])] for i in o], rel, k=50)
 
     print(f"\n== CatBoost rerank поверх BM25-пула, eval={n_eval} сессий "
           f"({time.time() - t0:.0f} c) ==")
