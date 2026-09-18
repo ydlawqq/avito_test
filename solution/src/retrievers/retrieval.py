@@ -107,20 +107,50 @@ class BM25Retriever:
         """Скор BM25 для всех документов корпуса по токенам запроса."""
         return self.bm25.get_scores(tokens)
 
-    def top_indices(self, tokens: list[str], top_k: int = 50) -> list[int]:
-        """Индексы top-k документов по BM25 (score > 0)."""
-        scores = self.score_tokens(tokens)
-        top = np.argsort(-scores)[:top_k]
+    def top_indices(
+        self,
+        tokens: list[str],
+        top_k: int = 50,
+        allow_zero_score: bool = False,
+    ) -> list[int]:
+        """Индексы top-k документов по BM25.
+
+        allow_zero_score=False — отсекаем документы без общих с запросом лемм
+        (score == 0): лексически они нерелевантны.
+        allow_zero_score=True — добираем и нулевые скоры, чтобы вернуть ровно
+        top_k индексов: у редких/опечатанных запросов («сабутыльник»,
+        «видеоограф») ненулевых скоров меньше top_k, а ответ должен быть полным.
+        """
+        return self._top_indices(self.score_tokens(tokens), top_k, allow_zero_score)
+
+    @staticmethod
+    def _top_indices(
+        scores: np.ndarray,
+        top_k: int,
+        allow_zero_score: bool = False,
+    ) -> list[int]:
+        """Top-k индексов по готовому вектору скоров (сортировка по убыванию)."""
+        n_take = min(len(scores), max(0, top_k))
+        if n_take == 0:
+            return []
+        # argpartition — O(N) вместо полного argsort на 190k документов
+        top = np.argpartition(-scores, n_take - 1)[:n_take]
+        top = top[np.argsort(-scores[top])]
+        if allow_zero_score:
+            return [int(i) for i in top]
         return [int(i) for i in top if scores[i] > 0]
 
     def search_tokens(
         self,
         tokens: list[str],
         top_k: int = 50,
+        allow_zero_score: bool = False,
     ) -> list[RetrievedDoc]:
         """Поиск по предобработанному (лемматизированному) запросу."""
-        idx = self.top_indices(tokens, top_k)
-        scores = self.bm25.get_scores(tokens)
+        # get_scores считается один раз: вызов top_indices + повторный
+        # score_tokens удваивал бы проход по всему корпусу на каждый запрос
+        scores = self.score_tokens(tokens)
+        idx = self._top_indices(scores, top_k, allow_zero_score)
         return [
             RetrievedDoc(
                 doc_id=self.doc_ids[i],

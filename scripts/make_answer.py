@@ -3,6 +3,7 @@
 Запуск:
     python scripts/make_answer.py --method bm25    # CPU
     python scripts/make_answer.py --method hybrid  # нужен artifacts/dense/e5.index
+    python scripts/make_answer.py --method bm25 --limit 100  # быстрый прогон
 
 Формат: query_id,answer — до 50 уникальных item_id через пробел.
 """
@@ -29,6 +30,15 @@ from src.pipeline.common import (
 )
 
 MAX_ANSWER = 50
+
+
+def format_answer(doc_ids: list[str]) -> str:
+    """Строка ответа: до MAX_ANSWER уникальных item_id через пробел.
+
+    NB: dict.fromkeys отдаёт dict, по нему нельзя срезать — нужен list().
+    """
+    unique = list(dict.fromkeys(doc_ids))
+    return " ".join(unique[:MAX_ANSWER])
 
 
 def predict_bm25(cfg: dict, queries: pd.DataFrame) -> dict[str, list[str]]:
@@ -118,12 +128,15 @@ def main() -> None:
     parser.add_argument("--method", choices=["bm25", "dense", "hybrid"], required=True)
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
     parser.add_argument("--out", default=None, help="путь до answer.csv")
+    parser.add_argument("--limit", type=int, default=None, help="число benchmark-запросов")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     raw_dir = PROJECT_ROOT / cfg["paths"]["raw_data_dir"]
     queries = pd.read_parquet(raw_dir / "benchmark_queries.parquet")
-    print(f"Benchmark-запросов: {len(queries)}")
+    if args.limit:
+        queries = queries.head(args.limit)
+    print(f"Benchmark-запросов: {len(queries)} (limit={args.limit or 'all'})")
 
     if args.method == "bm25":
         predictions = predict_bm25(cfg, queries)
@@ -136,10 +149,7 @@ def main() -> None:
     answer = pd.DataFrame(
         {
             "query_id": queries["query_id"],
-            "answer": [
-                " ".join(dict.fromkeys(predictions.get(q, []))[:MAX_ANSWER])
-                for q in queries["query_id"]
-            ],
+            "answer": [format_answer(predictions.get(q) or []) for q in queries["query_id"]],
         }
     )
     out_path = Path(args.out) if args.out else PROJECT_ROOT / cfg["paths"]["answer_dir"] / "answer.csv"
