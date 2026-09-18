@@ -1,0 +1,44 @@
+# Конфиг пайплайна candidate generation. Все скрипты в scripts/ читают его.
+
+paths:
+  raw_data_dir: raw_data
+  artifacts_dir: artifacts
+  answer_dir: answer
+
+preprocessing:
+  description_max_chars: 600   # усечение описания перед лемматизацией (скорость)
+  n_jobs: 12                   # воркеров для лемматизации
+
+bm25:
+  title_weight: 3              # сколько раз повторять леммы заголовка в документе
+  use_description: true        # включать ли описание в документ BM25
+  use_params: true             # включать ли item_infm_params_text
+  category_boost: 0.0          # множитель (1 + boost) при совпадении категории
+                               # (бесполезен: 99% корпуса — категория 114)
+  location_boost: 2.0          # множитель (1 + boost) при совпадении локации;
+                               # 83% релевантных items — в локации поиска
+  boost_pool: 5000             # размер сырого BM25-пула для бустов (главный фактор)
+  k1: 1.5
+  epsilon: 0.75
+
+dense:
+  model_name: intfloat/multilingual-e5-large
+  query_prefix: "query: "
+  passage_prefix: "passage: "
+  chunk_words: 200             # размер чанка описания в словах
+  chunk_overlap: 50            # перекрытие между чанками
+  max_chunks_per_item: 3       # 1 чанк title+params + 2 чанка описания
+  batch_size: 256
+  max_length: 512
+
+hybrid:
+  rrf_k: 60
+  candidates_per_retriever: 100
+  dense_weight: 1.0
+
+validation:
+  seed: 42
+  size: 2452                   # столько же запросов, сколько в benchmark
+
+recall:
+  k: 50
