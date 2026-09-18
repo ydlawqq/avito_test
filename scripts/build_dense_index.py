@@ -111,7 +111,7 @@ def main() -> None:
     ids = np.arange(len(chunk_texts), dtype="int64")
     index.add_with_ids(embeddings, ids)
 
-    index_path = out_dir / "e5.index"
+    index_path = out_dir / "baaim3.index"
     faiss.write_index(index, str(index_path))
     np.save(out_dir / "chunk_item_ids.npy", np.asarray(chunk_item_ids))
     print(f"Сохранён индекс: {index_path}; маппинг: chunk_item_ids.npy")

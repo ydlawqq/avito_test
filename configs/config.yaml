@@ -22,9 +22,7 @@ bm25:
   epsilon: 0.75
 
 dense:
-  model_name: intfloat/multilingual-e5-large
-  query_prefix: "query: "
-  passage_prefix: "passage: "
+  model_name: BAAI/bge-m3
   chunk_words: 200             # размер чанка описания в словах
   chunk_overlap: 50            # перекрытие между чанками
   max_chunks_per_item: 3       # 1 чанк title+params + 2 чанка описания
