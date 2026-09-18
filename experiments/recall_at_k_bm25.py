@@ -1,29 +1,31 @@
-"""Recall@k (k = 50, 250, 500, 1000, 3000, 5000, 10000) для ЧИСТОГО BM25 на всём трейне.
+"""Recall@k (k = 50, 250, 500, 1000, 3000, 5000, 10000) для ЧИСТОГО BM25
+на локальной валидации — том же наборе запросов, что использует scripts/evaluate.py.
 
 Запуск (CPU; скрипт рассчитан на прогон на другой машине) из корня проекта:
     python experiments/recall_at_k_bm25.py
-    python experiments/recall_at_k_bm25.py --size 2000 --out artifacts/recall_at_k_bm25.csv
+    python experiments/recall_at_k_bm25.py --size 200 --out artifacts/recall_at_k_bm25.csv
 
-Что считаем:
-  * корпус    — artifacts/items_processed.parquet (все объявления benchmark_items,
-                леммы title/params/description уже посчитаны scripts/prepare_data.py);
-  * запросы   — ВЕСЬ train.parquet: все уникальные поисковые сессии
-                (ключ = search_query + location + delivery + infm_params + category),
-                у которых хотя бы один релевантный item есть в корпусе.
-                Правила те же, что в src/evaluation/validation.py, но БЕЗ сэмплирования
-                до validation.size (2452) — берутся все сессии трейна;
-  * ретривер  — ЧИСТЫЙ BM25 (rank_bm25.BM25Okapi) из cfg["bm25"]:
-                документ = леммы title_lem × title_weight + params_lem + desc_lem,
-                запрос   = леммы search_query + search_infm_params_text.
-                Никаких бустов категории/локации (apply_metadata_boosts НЕ вызывается),
-                без dense/hybrid — только сырой BM25-скор;
-  * метрика   — Recall@k = |Top-k ∩ Relevant| / |Relevant|, среднее по сессиям.
-                Для каждого запроса top-10000 достаётся один раз, recall для всех k
-                считается кумулятивно (предсказания не копятся в памяти).
+Что читаем (raw_data/ НЕ нужен — оба файла лежат в artifacts/):
+  * запросы — artifacts/validation.parquet: 2452 сессии из train.parquet
+              (query_id, признаки запроса, relevant_items). Это тот же файл,
+              что читает scripts/evaluate.py, поэтому цифры сравнимы с его
+              прогонами на тех же запросах;
+  * корпус  — artifacts/items_processed.parquet (189k объявлений benchmark_items,
+              леммы title/params/description уже посчитаны scripts/prepare_data.py).
 
-Оговорка: сессии, у которых НИ ОДИН релевантный item не входит в корпус
-benchmark_items, отбрасываются — иначе recall был бы занижен недостижимыми
-объявлениями (та же логика, что в src/evaluation/validation.py).
+Полный трейн (26 556 сессий) здесь намеренно НЕ используется: релевантность для
+остальных сессий есть только в 490-МБ raw_data/train.parquet, который нужен лишь
+там, где строится сама валидация (scripts/prepare_data.py).
+
+Ретривер — ЧИСТЫЙ BM25 (rank_bm25.BM25Okapi) из cfg["bm25"]:
+    документ = леммы title_lem × title_weight + params_lem + desc_lem,
+    запрос   = леммы search_query + search_infm_params_text.
+Никаких бустов категории/локации (apply_metadata_boosts НЕ вызывается),
+без dense/hybrid — только сырой BM25-скор.
+
+Метрика — Recall@k = |Top-k ∩ Relevant| / |Relevant|, среднее по сессиям.
+Для каждого запроса top-10000 достаётся один раз, recall для всех k считается
+кумулятивно (предсказания не копятся в памяти).
 
 Существующий код пайплайна не изменяется — используются готовые функции src/*.
 """
@@ -31,6 +33,7 @@ benchmark_items, отбрасываются — иначе recall был бы з
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +45,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.data.preprocessing import get_stopwords
-from src.evaluation.validation import build_validation, validation_relevance
+from src.evaluation.validation import load_validation, validation_relevance
 from src.metrics.recall import recall_at_k
 from src.pipeline.common import (
     artifacts_dir,
@@ -56,8 +59,35 @@ from src.pipeline.common import (
 KS: tuple[int, ...] = (50, 250, 500, 1000, 3000, 5000, 10000)
 # Глубина выборки кандидатов за один проход (>= max(KS))
 TOP_K_MAX: int = max(KS)
-# «Весь трейн»: size для build_validation, заведомо больше числа сессий в трейне
-ALL_SESSIONS: int = 1_000_000_000
+
+
+def check_parquet(path: Path, what: str) -> None:
+    """Проверить, что файл есть и это parquet (magic-байты ``PAR1`` в начале и в конце).
+
+    Большие parquet (items_processed.parquet ~297 МБ) часто обрезаются при
+    копировании между машинами: pandas/pyarrow падают с невнятным «Parquet magic
+    bytes not found in footer. Either the file is corrupted or this is not a
+    parquet file» и вместо пути печатают ``<Buffer>``. Проверка даёт понятную
+    ошибку с именем файла и размером до тяжёлой работы.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{what} не найден: {path}")
+    size = path.stat().st_size
+    if size < 8:
+        raise ValueError(f"{what} повреждён: {path} — файл пуст или обрезан ({size} байт)")
+    with open(path, "rb") as f:
+        head = f.read(4)
+        f.seek(-4, os.SEEK_END)
+        tail = f.read(4)
+    if head != b"PAR1" or tail != b"PAR1":
+        raise ValueError(
+            f"{what} повреждён: {path} ({size} байт, head={head!r}, tail={tail!r}). "
+            "Ожидается parquet ('PAR1' ... 'PAR1') — скорее всего файл обрезался при "
+            "копировании. Перекопируйте файл целиком или пересоберите артефакты: "
+            "python scripts/prepare_data.py."
+        )
+    print(f"{what}: {path} ({size} байт) — parquet OK")
+
 
 
 class QueryLemmatizer:
@@ -111,7 +141,7 @@ def evaluate_pure_bm25(
     ks: tuple[int, ...] = KS,
     top_k_max: int = TOP_K_MAX,
 ) -> pd.DataFrame:
-    """Recall@k чистого BM25 по всем сессиям трейна. Возвращает таблицу {k, recall}."""
+    """Recall@k чистого BM25 по сессиям локальной валидации. Возвращает таблицу {k, recall}."""
     items = load_items(cfg)
     print(f"Корпус: {len(items)} объявлений")
 
@@ -131,7 +161,7 @@ def evaluate_pure_bm25(
 
     rel_sizes = np.array([len(v) for v in relevance.values()], dtype=np.int64)
     print(
-        f"Запросов (сессий трейна): {len(relevance)} | "
+        f"Запросов (сессий валидации): {len(relevance)} | "
         f"релевантных на запрос: mean={rel_sizes.mean():.3f}, "
         f"max={rel_sizes.max()}, сессий с >1 релевантным: {int((rel_sizes > 1).sum())}"
     )
@@ -141,7 +171,7 @@ def evaluate_pure_bm25(
     saturated = 0  # сессий, у которых кандидатов набралось >= top_k_max
 
     if not relevance:
-        print("Нет сессий для оценки — проверьте пути к train.parquet / корпусу.")
+        print("Нет сессий для оценки — проверьте пустой validation.parquet.")
         return pd.DataFrame({"k": list(ks), "recall": [0.0] * len(ks)})
 
     for row in tqdm(
@@ -162,7 +192,7 @@ def evaluate_pure_bm25(
         {"k": list(ks), "recall": [recall_sum[k] / n if n else 0.0 for k in ks]}
     )
 
-    print("\n== Чистый BM25: Recall@k на всём трейне ==")
+    print("\n== Чистый BM25: Recall@k на локальной валидации ==")
     print(f"{'k':>8s} {'Recall@k':>10s}")
     for k, value in result.itertuples(index=False):
         print(f"{k:>8d} {value:>10.4f}")
@@ -182,7 +212,7 @@ def main() -> None:
         "--size",
         type=int,
         default=None,
-        help="сколько сессий трейна оценивать (по умолчанию — все сессии)",
+        help="сколько сессий валидации оценивать (по умолчанию — все 2452)",
     )
     parser.add_argument(
         "--out",
@@ -190,37 +220,27 @@ def main() -> None:
         help="если задан, сохранить таблицу Recall@k в CSV по этому пути",
     )
     parser.add_argument(
-        "--train",
+        "--validation",
         default=None,
-        help="путь к train.parquet (по умолчанию raw_data/train.parquet из конфига)",
-    )
-    parser.add_argument(
-        "--items",
-        default=None,
-        help="путь к benchmark_items.parquet (по умолчанию raw_data/benchmark_items.parquet)",
+        help="путь к validation.parquet (по умолчанию artifacts/validation.parquet)",
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    raw_dir = PROJECT_ROOT / cfg["paths"]["raw_data_dir"]
-    train_path = Path(args.train) if args.train else raw_dir / "train.parquet"
-    items_path = Path(args.items) if args.items else raw_dir / "benchmark_items.parquet"
+    artifacts = artifacts_dir(cfg)
+    val_path = Path(args.validation) if args.validation else artifacts / "validation.parquet"
+    items_path = artifacts / "items_processed.parquet"
 
-    if args.size is None:
-        print(f"Валидация: весь train ({train_path}) — все сессии, без сэмплирования")
-        size = ALL_SESSIONS
-    else:
-        print(f"Валидация: train ({train_path}), не более {args.size} сессий")
-        size = args.size
+    # Проверяем целостность входных parquet до тяжёлых операций:
+    # validation.parquet даёт запросы и разметку, items_processed.parquet — корпус BM25.
+    check_parquet(val_path, "validation.parquet")
+    check_parquet(items_path, "items_processed.parquet")
 
-    validation = build_validation(
-        train_path=train_path,
-        items_path=items_path,
-        size=size,
-        seed=cfg["validation"]["seed"],
-    )
-    print(f"Сессий трейна с item из корпуса: {len(validation)}")
-    print(f"Артефакты: {artifacts_dir(cfg)}")
+    validation = load_validation(val_path)
+    if args.size:
+        validation = validation.head(args.size)
+    print(f"Сессии валидации: {len(validation)} из {val_path}")
+    print(f"Артефакты: {artifacts}")
 
     result = evaluate_pure_bm25(cfg, validation)
 
