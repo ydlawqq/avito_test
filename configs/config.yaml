@@ -15,6 +15,10 @@ bm25:
   use_params: true             # включать ли item_infm_params_text
   category_boost: 0.0          # множитель (1 + boost) при совпадении категории
                                # (бесполезен: 99% корпуса — категория 114)
+  category_filter: true        # жёстко искать только в категории запроса (до бустов):
+                               # категория item == категория запроса в 497620/497673
+                               # пар train (99.989%); если категории запроса нет в
+                               # корпусе (search_category=0), фильтр не применяется
   location_boost: 2.0          # множитель (1 + boost) при совпадении локации;
                                # 83% релевантных items — в локации поиска
   boost_pool: 5000             # размер сырого BM25-пула для бустов (главный фактор)
@@ -40,3 +44,23 @@ validation:
 
 recall:
   k: 50
+
+xgb_rerank:
+  depth: 1000          # размер переранжированного BM25-пула, который переранжирует
+                       # модель (сырой пул bm25.boost_pool=5000 -> бусты -> топ-1000)
+  model: artifacts/xgb_rerank/model.json
+  categories: artifacts/xgb_rerank/cat_categories.json
+
+# Второй слой реранка: XGBoost -> топ-xgb_topk -> кросс-энкодер -> топ-50.
+# Кросс-энкодер оценивает пару (запрос, объявление) совместно (attention) и
+# точнее табличных признаков, но дорог — поэтому считается только на коротком
+# списке кандидатов от XGBoost. Метод: scripts/evaluate.py --method xgb_ce,
+# scripts/make_answer.py --method xgb_ce. Модель кэшируется HuggingFace.
+cross_encoder:
+  model: BAAI/bge-reranker-v2-m3   # multilingual cross-encoder (ru в обучении)
+  xgb_topk: 150        # сколько кандидатов XGB-ранжировки уходит в кросс-энкодер
+  max_length: 512      # максимум токенов пары (обрезка длинных описаний)
+  batch_size: 32       # размер батча скоринга пар (память/скорость)
+  desc_max_chars: 600  # усечение описания в тексте пары (как в preprocessing)
+  device: null         # cuda / cpu; null -> автоопределение (cuda, если есть)
+

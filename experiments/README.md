@@ -134,5 +134,228 @@ python experiments/dense_rerank_10k.py               # все сессии пу�
 со ~26k чанков своего пула, а не с 560k всего корпуса. Кэш эмбеддингов
 (`pool_shards/`) при этом переиспользуется между прогонами и сетками весов.
 Если кодирование всего корпуса неприемлемо по времени — уменьшите `--pool`
+## xgb_rerank/ — XGBoost-реранкер поверх «BM25 с бустами → топ-1000»
+
+Продакшн-пайплайн, под который строится модель:
+
+```text
+чистый BM25 -> сырой пул top-5000 (bm25.boost_pool)
+            -> мягкие бусты score * (1 + loc_boost * loc_match)
+            -> переранжированный ТОП-1000          <- вход реранкера
+            -> XGBRanker (признаки пары запрос x объявление)
+            -> финальный топ-50
+```
+
+### Headroom (по готовому artifacts/bm25_pool.parquet, 2452 сессии)
+
+| k (переранжированный пул) | Recall@k |
+|---|---|
+| 50 (бейзлайн bm25+loc) | 0.7874 |
+| 100 | 0.8358 |
+| 250 | 0.8820 |
+| 500 | 0.9067 |
+| 1000 | **0.9262** |
+
+Т.е. у реранкера на топ-1000 потолок Recall@50 ≈ 0.926 против 0.787 у
+текущего бустнутого BM25 (+14 п.п.). 12.5% релевантных попадают в
+бустнутый топ-1000 только благодаря бусту локации — их ранги модель и
+должна выучивать.
+
+### Признаки (solution/src/rerank/xgb_features.py)
+
+У ЗАПРОСА доступны ТОЛЬКО `search_*` признаки (как в benchmark_queries):
+`search_query`, `search_location_id`, `search_is_delivery_search`,
+`search_infm_params_text`, `search_category` (99.98% = 114, delivery = 1 в
+0.002% строк, фильтры пустые в 33% строк). Сторона объявления — из корпуса
+(benchmark_items / items_processed). Всего 30 числовых + 2 категориальных
+(microcat_id, search_loc, enable_categorical):
+
+* retrieval-сигналы: `bm25_score`, `bm25_boosted`, `bm25_rank_raw`,
+  `bm25_rank` (входной порядок топа-1000), `rank_pct`;
+* метадата: `loc_match`, `cat_match`;
+* лексика: пересечения/покрытия лемм запроса с заголовком/params/описанием,
+  подстрочные фичи по сырому заголовку (`title_substr`, `title_startswith`);
+* длины текстов и запроса, `is_delivery`;
+* априорика объявления: `price_log`, `has_price`, `rating`, `reviews_log`,
+  `phone_hidden`, `message_forbidden`, `microcat_freq`, `loc_freq`.
+
+Один и тот же код фич используется на этапе датасета, обучения и инференса
+(`scripts/make_answer.py --method xgb`) — расхождение train/inference исключено.
+
+### Этап 1 — build_dataset.py (CPU, ~10–15 мин на 2452 сессии)
+
+Для каждой сессии воспроизводит продакшн-вход: сырой BM25-топ-5000 → бусты →
+топ-1000 → пары с label (пользователь выбирал объявление по запросу) и
+фичами. Сплит по сессиям в md5-порядке: 70% train / 30% eval (eval-сессии не
+пересекаются с validation.parquet). `--train-from raw_data/train.parquet`
+берёт ВСЕ ~26.5k сессий трейна (больше данных, ~2 ч CPU); `--neg-frac 0.3`
+сэмплирует негативы глубже 50-го места в train-части.
+
+```bash
+python experiments/xgb_rerank/build_dataset.py > artifacts/xgb_rerank/build.log 2>&1
+python experiments/xgb_rerank/build_dataset.py --train-from raw_data/train.parquet \
+    > artifacts/xgb_rerank/build_full.log 2>&1
+```
+
+### Этап 2 — train_xgb_reranker.py (CPU/GPU)
+
+XGBRanker, objective rank:ndcg; early stopping по КАСТОМНОЙ set-метрике
+Recall@50 (feval, имя recall@50-max — суффикс `-max` включает максимизацию;
+signature per-group `(y_true, y_score)`, т.к. sklearn-интерфейс ранкера
+оборачивает callable-метрики ltr_metric_decorator'ом по группам),
+ndcg@50 печатается для сравнения. Train-группы без позитивов отбрасываются
+(в них лямбда-градиенты нулевые). `--n-jobs` по умолчанию None: значение -1
+ломает ltr-декоратор метрик (ThreadPoolExecutor(max_workers=-1)).
+ВНИМАНИЕ: НЕ собирайте датасет с --neg-frac 0 — тогда в train-части
+остаются только ~50 головных строк сессии и модель не видит позитивов
+на местах 51–1000 (главный слой для выучивания). Рекомендуется
+`--neg-frac 0.3` или полный пул.
+Печатает настоящий Recall@50 на eval-сессиях: бейзлайн `bm25+loc@50`, прямой
+`xgb@50`, гибриды `xgbR->loc@50` (топ-R по XGB → переранжирование бустнутым
+BM25) и `xgb->rrf<w>@50` (RRF рангов). Сохраняет `model.json` +
+`cat_categories.json`. `--xgb-model model.json` — дообучить поверх готовой
+модели (fit xgb_model=...).
+
+```bash
+python experiments/xgb_rerank/train_xgb_reranker.py > artifacts/xgb_rerank/train.log 2>&1
+# дообучение существующей модели:
+python experiments/xgb_rerank/train_xgb_reranker.py \
+    --xgb-model artifacts/xgb_rerank/model.json --eta 0.01
+```
+
+### Этап 3 — инференс
+
+```bash
+python scripts/make_answer.py --method xgb --limit 100   # пилот
+python scripts/make_answer.py --method xgb               # answer.csv
+```
+
+### Этап 4 — оценка реранкера (Recall@50)
+
+```bash
+# быстрый прогон на части валидации
+python scripts/evaluate.py --method xgb --limit 300
+
+# Честная оценка без утечки: holdout-сессии датасета (не участвовали ни в
+# обучении, ни в early stopping). Атрибуты запросов подтягиваются из train.parquet.
+python scripts/evaluate.py --method xgb \
+    --dataset artifacts/xgb_rerank/dataset_resampled.parquet --split holdout
+```
+
+#### Recall@k при k != 50
+
+```bash
+# таблица Recall@50/100/150 (реранкер отдаёт max(k)=150 кандидатов из пула 1000)
+python scripts/evaluate.py --method xgb --k 50,100,150 \
+    --dataset artifacts/xgb_rerank/dataset_resampled.parquet --split holdout
+
+# на валидации (быстрее, но с утечкой train-сессий)
+python scripts/evaluate.py --method xgb --k 50,100,150 --limit 300
+```
+
+Печатается таблица: `k | xgb | bm25+loc | прирост`. Реранкер возвращает `max(k)`
+кандидатов из переранжированного пула (но не больше `depth`), бейзлайн берётся из
+головы того же пула — сравнение честное. Ориентир (holdout, 100 сессий):
+`k=50: 0.878 vs 0.851 (+2.7 п.п.)`, `k=100: 0.910 vs 0.910 (паритет)`,
+`k=150: 0.930 vs 0.940 (-1.0 п.п.)` — выигрыш реранкера сосредоточен в топ-50,
+а на 100/150 голова бустнутого BM25 уже почти исчерпывает recall.
+
+Внимание про утечку: `validation.parquet`-сессии входят в train-часть датасетов
+`dataset.parquet`/`dataset_resampled.parquet`, поэтому оценка без `--dataset`
+оптимистична. Печатается Recall@50 реранкера и бейзлайна `bm25+loc@50` на тех же
+запросах (голова того же пула), плюс прирост.
+
+`evaluate.py --method xgb` и `make_answer.py --method xgb` вызывают ОДИН и тот же
+код инференса (`solution/src/rerank/inference.py::rerank_xgb`), поэтому метрика
+оценки соответствует формируемому ответу.
+
+Важно (исправлено): в `predict_xgb` топ-50 доставался по позициям внутри пула
+(`retriever.doc_ids[i]`), а не по индексам корпуса. Из-за этого ответы брались
+из первых 1000 позиций корпуса и скор на бенчмарке падал до ~0.004. Теперь
+маппинг корректный — `retriever.doc_ids[corpus_idx[order]]`, и результат
+инференса совпадает с локальными метриками (`xgb@50` = 0.898 на holdout).
+Проверка-регресс: пересечение топ-50 `xgb` и `bm25+loc` на одних запросах
+должно быть ~0.6-1.0, а не 0.
+
+Скорость инференса та же, что у метода bm25 (BM25-скоринг всего корпуса на
+запрос), плюс предсказание XGB на 1000 строк — копейки.
+
+### Smoke
+
+`dataset_smoke.parquet` / `model_smoke.json` — прогон на 3 сессиях
+(--size 3, --iterations 50) только для проверки кода; в answer.csv их не
+использовать.
+
+## Слой кросс-энкодера (XGB -> топ-150 -> reranker -> топ-50)
+
+Второй слой реранка поверх XGBoost-ранжировки:
+
+```text
+BM25 + бусты локации/категории
+    -> переранжированный топ-1000 (cfg.xgb_rerank.depth)
+    -> XGBRanker
+    -> топ-150 (cfg.cross_encoder.xgb_topk)   <- только эти пары идут в CE
+    -> кросс-энкодер BAAI/bge-reranker-v2-m3  <- совместный скоринг (query, item)
+    -> финальный топ-50
+```
+
+Почему так: кросс-энкодер точнее табличных признаков XGBoost (он читает запрос и
+объявление вместе, механизмом внимания), но одна пара = один прогон трансформера,
+поэтому его считают только на коротком списке — 150 пар на запрос вместо ~1000-5000.
+Каждое объявление в паре — текст `title_raw + params_raw + desc_raw`
+(описание усечено до `cfg.cross_encoder.desc_max_chars`), запрос — `search_query` +
+`search_infm_params_text` (то же, что в benchmark_queries.parquet).
+
+### Код
+
+| файл | что |
+|---|---|
+| `solution/src/rerank/cross_encoder.py` | `CrossEncoderReranker` (обёртка sentence-transformers `CrossEncoder`), сборка текстов пары |
+| `solution/src/rerank/inference.py` | `rerank_xgb_ce` — общий с stage-1 пайплайн; `_load_stage1`/`_stage1_scores` — общий «BM25+бусты -> топ-depth -> XGB» |
+| `scripts/evaluate.py --method xgb_ce` | Recall@k с таблицей трёх слоёв (`xgb+ce` / `xgb` / `bm25+loc`) |
+| `scripts/make_answer.py --method xgb_ce` | answer.csv тем же кодом инференса |
+
+### Запуск
+
+```bash
+# честная оценка без утечки: holdout-сессии (не были ни в train, ни в early stopping)
+python scripts/evaluate.py --method xgb_ce \
+    --dataset artifacts/xgb_rerank/dataset_resampled.parquet --split holdout
+
+# таблица Recall@50/100/150 (CE отдаёт top max(k) из 150 кандидатов XGB)
+python scripts/evaluate.py --method xgb_ce --k 50,100,150 \
+    --dataset artifacts/xgb_rerank/dataset_resampled.parquet --split holdout
+
+# быстрый пилот на части валидации / смена размера входа кросс-энкодера
+python scripts/evaluate.py --method xgb_ce --limit 100 --xgb-topk 100
+
+# ответ
+python scripts/make_answer.py --method xgb_ce          # answer.csv
+python scripts/make_answer.py --method xgb_ce --limit 100   # пилот
+```
+
+Полезные флаги: `--xgb-topk` (сколько кандидатов XGB уходит в CE; по умолчанию 150),
+`--ce-model` (по умолчанию `BAAI/bge-reranker-v2-m3`), `--ce-device cuda|cpu`,
+`--ce-max-length`, `--ce-batch-size`. Все значения по умолчанию — в
+`cfg.cross_encoder` (`configs/config.yaml`); явный флаг перекрывает конфиг.
+
+### Ожидания и оговорки
+
+* Прирост нового слоя виден в первую очередь на `k=50` (как и у XGB): при
+  `--k 150` ответ CE — это перестановка тех же 150 кандидатов, что у XGB, поэтому
+  `ce-xgb` на `k=150` обязан быть равен 0 (хорошая проверка корректности: множество
+  кандидатов CE ⊆ топ-`xgb_topk` XGB).
+* Честная оценка требует `--dataset ... --split holdout`: сами XGB-модели обучены на
+  сессиях из `dataset*.parquet`, а CE (bge-reranker-v2-m3) — предобученная модель,
+  её дообучения не требуется.
+* Ресурсы: слой — самая тяжёлая часть пайплайна. 2452 запроса × 150 пар = ~368k
+  прогонов трансформера на `max_length=512`; на CPU это часы, нужен GPU
+  (`--ce-device cuda`, разумный `--ce-batch-size`). Держите `--limit`, чтобы
+  обкатать код, и помните про память: BM25-индекс + `items_processed.parquet`
+  (189k строк с леммами) + веса CE (~0.6B параметров) одновременно.
+* Первый прогон качает модель в кэш HuggingFace (~2.3 ГБ для bge-reranker-v2-m3);
+  дальше загрузка локальная. Работает без внешних API во время инференса.
+
+
 (например 2000: recall@2000 = 0.90, объединение пулов заметно уже) или
 оценивайте на подвыборке сессий `--size`.

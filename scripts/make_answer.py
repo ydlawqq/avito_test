@@ -3,7 +3,19 @@
 Запуск:
     python scripts/make_answer.py --method bm25    # CPU
     python scripts/make_answer.py --method hybrid  # нужен artifacts/dense/e5.index
+    python scripts/make_answer.py --method xgb     # BM25+бусты топ-1000 -> XGBRanker
+    python scripts/make_answer.py --method xgb_ce  # + кросс-энкодер поверх топ-150 XGB
     python scripts/make_answer.py --method bm25 --limit 100  # быстрый прогон
+
+Метод xgb: пайплайн «BM25 с бустами -> переранжированный топ-1000 ->
+XGBoost-реранкер -> топ-50». Нужны артефакты обучения
+(artifacts/xgb_rerank/model.json + cat_categories.json, см.
+experiments/xgb_rerank/), путь можно переопределить --model/--categories.
+
+Метод xgb_ce: тот же stage-1, но после XGB берётся только топ-`--xgb-topk` (150,
+cfg.cross_encoder.xgb_topk) кандидатов, они переранжируются кросс-энкодером
+(BAAI/bge-reranker-v2-m3 по умолчанию), из его порядка берётся финальный топ-50.
+Кросс-энкодер считается на GPU, если доступна (--ce-device cuda/cpu).
 
 Формат: query_id,answer — до 50 уникальных item_id через пробел.
 """
@@ -17,6 +29,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "solution"))
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -30,6 +43,7 @@ from src.pipeline.common import (
 )
 
 MAX_ANSWER = 50
+
 
 
 def format_answer(doc_ids: list[str]) -> str:
@@ -123,12 +137,69 @@ def predict_hybrid(cfg: dict, queries: pd.DataFrame) -> dict[str, list[str]]:
     return predictions
 
 
+def predict_xgb(cfg: dict, queries: pd.DataFrame, model_path: str, categories_path: str,
+                depth: int) -> dict[str, list[str]]:
+    """BM25 с бустами -> переранжированный топ-`depth` -> XGBoost -> топ-50.
+
+    Тонкая обёртка над общей реализацией (src/rerank/inference.py): тот же код
+    используется в scripts/evaluate.py --method xgb, поэтому метрика оценки и
+    формируемый ответ не могут разойтись.
+    """
+    from src.rerank.inference import rerank_xgb
+
+    return rerank_xgb(cfg, queries, model_path, categories_path, depth)
+
+
+def predict_xgb_ce(cfg: dict, queries: pd.DataFrame, model_path: str,
+                   categories_path: str, depth: int, xgb_topk: int | None = None,
+                   ce_model: str | None = None, ce_device: str | None = None,
+                   ce_max_length: int | None = None,
+                   ce_batch_size: int | None = None) -> dict[str, list[str]]:
+    """BM25+бусты -> топ-`depth` -> XGB -> топ-`xgb_topk` -> кросс-энкодер -> топ-50.
+
+    Тонкая обёртка над общей реализацией (src/rerank/inference.py): тот же код
+    используется в scripts/evaluate.py --method xgb_ce, поэтому метрика оценки
+    и формируемый ответ не могут разойтись.
+    """
+    from src.rerank.inference import rerank_xgb_ce
+
+    return rerank_xgb_ce(
+        cfg, queries, model_path, categories_path, depth,
+        xgb_topk=xgb_topk, ce_model=ce_model, ce_device=ce_device,
+        ce_max_length=ce_max_length, ce_batch_size=ce_batch_size,
+        max_answer=MAX_ANSWER,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", choices=["bm25", "dense", "hybrid"], required=True)
+    parser.add_argument("--method", choices=["bm25", "dense", "hybrid", "xgb", "xgb_ce"],
+                        required=True)
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
     parser.add_argument("--out", default=None, help="путь до answer.csv")
     parser.add_argument("--limit", type=int, default=None, help="число benchmark-запросов")
+    parser.add_argument("--model", default=None,
+                        help="model.json XGBRanker (методы xgb / xgb_ce; "
+                        "по умолчанию cfg.xgb_rerank.model)")
+    parser.add_argument("--categories", default=None,
+                        help="cat_categories.json (методы xgb / xgb_ce; "
+                        "по умолчанию cfg.xgb_rerank.categories)")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="глубина переранжированного BM25-пула (методы xgb / xgb_ce; "
+                        "по умолчанию cfg.xgb_rerank.depth)")
+    parser.add_argument("--xgb-topk", type=int, default=None,
+                        help="сколько кандидатов XGB уходит в кросс-энкодер (метод xgb_ce; "
+                        "по умолчанию cfg.cross_encoder.xgb_topk=150)")
+    parser.add_argument("--ce-model", default=None,
+                        help="имя/путь кросс-энкодера (метод xgb_ce; по умолчанию "
+                        "cfg.cross_encoder.model=BAAI/bge-reranker-v2-m3)")
+    parser.add_argument("--ce-device", default=None,
+                        help="device кросс-энкодера: cuda / cpu (метод xgb_ce; "
+                        "по умолчанию автоопределение)")
+    parser.add_argument("--ce-max-length", type=int, default=None,
+                        help="макс. токенов пары для кросс-энкодера (метод xgb_ce)")
+    parser.add_argument("--ce-batch-size", type=int, default=None,
+                        help="batch size кросс-энкодера (метод xgb_ce)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -142,6 +213,22 @@ def main() -> None:
         predictions = predict_bm25(cfg, queries)
     elif args.method == "dense":
         predictions = predict_dense(cfg, queries)
+    elif args.method in ("xgb", "xgb_ce"):
+        xcfg = cfg.get("xgb_rerank", {})
+        model_path = args.model or str(PROJECT_ROOT / xcfg.get(
+            "model", "artifacts/xgb_rerank/model.json"))
+        categories_path = args.categories or str(PROJECT_ROOT / xcfg.get(
+            "categories", "artifacts/xgb_rerank/cat_categories.json"))
+        depth = args.depth or int(xcfg.get("depth", 1000))
+        if args.method == "xgb":
+            predictions = predict_xgb(cfg, queries, model_path, categories_path, depth)
+        else:
+            predictions = predict_xgb_ce(
+                cfg, queries, model_path, categories_path, depth,
+                xgb_topk=args.xgb_topk, ce_model=args.ce_model,
+                ce_device=args.ce_device, ce_max_length=args.ce_max_length,
+                ce_batch_size=args.ce_batch_size,
+            )
     else:
         predictions = predict_hybrid(cfg, queries)
 
