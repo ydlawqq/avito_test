@@ -123,6 +123,7 @@ def apply_metadata_boosts(
     category_boost: float = 0.0,
     location_boost: float = 0.0,
     pool: int = 200,
+    fill_to_top_k: bool = True,
 ) -> list[str]:
     """BM25 top-k с мягкими бустами за совпадение категории/локации.
 
@@ -132,9 +133,17 @@ def apply_metadata_boosts(
     pool: размер сырого BM25-пула, внутри которого применяются бусты
     (top-50 достаётся из него). Больше пул — больше шансов, что
     локально-совпадающий документ из глубины ранга поднимется в топ.
+
+    fill_to_top_k: добирать ответ до top_k кандидатами с нулевым скором.
+    Нужно для редких/опечатанных запросов (напр. «сабутыльник», «видеоограф»):
+    лемма встречается в единицах объявлений, ненулевых скоров < top_k, и без
+    добора ответ получается короче 50 (вплоть до пустого). Добор не может
+    ухудшить Recall@50: существующий топ только дополняется, не вытесняется.
     """
     scores = retriever.score_tokens(tokens)
     n_take = min(len(scores), max(pool, top_k))
+    if n_take == 0:
+        return []
     idx = np.argpartition(-scores, n_take - 1)[:n_take]
     idx = idx[scores[idx] > 0]
 
@@ -157,4 +166,55 @@ def apply_metadata_boosts(
 
     boosted = scores[idx] * mult
     order = np.argsort(-boosted)[:top_k]
-    return [retriever.doc_ids[int(i)] for i in idx[order]]
+    result = [retriever.doc_ids[int(i)] for i in idx[order]]
+
+    if fill_to_top_k and len(result) < top_k:
+        result = _fill_with_zero_score(
+            retriever,
+            items,
+            scores,
+            result,
+            top_k,
+            search_category,
+            search_location_id,
+            category_boost,
+            location_boost,
+        )
+    return result
+
+
+def _fill_with_zero_score(
+    retriever: BM25Retriever,
+    items: pd.DataFrame,
+    scores: np.ndarray,
+    result: list[str],
+    top_k: int,
+    search_category: int | None,
+    search_location_id: int | None,
+    category_boost: float,
+    location_boost: float,
+) -> list[str]:
+    """Дополнить result до top_k, взяв остальные документы по убыванию скора.
+
+    Здесь участвуют и нулевые скоры (документы без общих с запросом лемм):
+    порядок среди них задаётся только бустами локации/категории, поэтому
+    результат детерминирован (np.argsort стабилен по индексам).
+    """
+    mult_all = np.ones(len(scores))
+    if category_boost > 0 and search_category is not None and "item_category_id" in items:
+        cats = items["item_category_id"].to_numpy()
+        mult_all *= 1.0 + category_boost * (cats == search_category)
+    if location_boost > 0 and search_location_id is not None and "item_location_id" in items:
+        locs = items["item_location_id"].to_numpy()
+        mult_all *= 1.0 + location_boost * (locs == search_location_id)
+
+    seen = set(result)
+    for i in np.argsort(-(scores * mult_all)):
+        doc_id = retriever.doc_ids[int(i)]
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        result.append(doc_id)
+        if len(result) >= top_k:
+            break
+    return result

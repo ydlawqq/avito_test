@@ -4,6 +4,7 @@
     python scripts/evaluate.py --method bm25   [--limit 500]   # CPU, быстро
     python scripts/evaluate.py --method dense  [--limit 500]   # нужен artifacts/dense/e5.index
     python scripts/evaluate.py --method hybrid [--limit 500]
+    python scripts/evaluate.py --method xgb    [--limit 500]   # XGBoost-реранкер
 
 bm25: перебирает варианты конфигурации (описание on/off, вес заголовка,
 бусты категории/локации) и печатает Recall@50 каждого — выбор лучшего
@@ -11,6 +12,14 @@ bm25: перебирает варианты конфигурации (описа
 
 Валидация построена из train.parquet: только запросы, чьи релевантные
 объявления есть в корпусе benchmark_items.parquet (см. src/evaluation/validation.py).
+
+xgb: оценка XGBoost-реранкера (BM25 с бустами -> топ-1000 -> XGBRanker ->
+топ-50) ровно тем же кодом, что scripts/make_answer.py --method xgb (см.
+src/rerank/inference.py), поэтому метрика соответствует формируемому ответу.
+По умолчанию считается на validation.parquet: если модель обучалась на датасете,
+куда эти сессии вошли в train-часть (artifacts/xgb_rerank/dataset*.parquet),
+цифра оптимистична (утечка). Честный режим:
+    --dataset artifacts/xgb_rerank/dataset_resampled.parquet --split holdout
 """
 
 from __future__ import annotations
@@ -66,180 +75,186 @@ def subsample_corpus(
     rel_part = items[items["item_id"].isin(relevant)]
     rest = items[~items["item_id"].isin(relevant)]
     n_distract = max(0, n - len(rel_part))
-    if n_distract < len(rest):
-        rest = rest.sample(n_distract, random_state=seed)
-    out = pd.concat([rel_part, rest]).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    print(
-        f"Подвыборка корпуса: {len(out)} объявлений "
-        f"(из них релевантных: {len(rel_part)})"
-    )
-    return out
+    if n_distract > 0:
+        rest = rest.sample(n=n_distract, random_state=seed)
+    return pd.concat([rel_part, rest], ignore_index=True)
 
 
 def evaluate_bm25(
-    cfg: dict,
-    validation: pd.DataFrame,
-    limit: int | None,
-    sample_corpus: int | None = None,
+    cfg: dict, validation: pd.DataFrame, limit=None, sample_corpus=None
 ) -> None:
-    """Перебор вариантов BM25.
-
-    sample_corpus: чтобы не поймать OOM на полном корпусе, можно оценить
-    варианты на подвыборке корпуса (все релевантные items всегда включаются).
-    Финальные цифры снимать на полном корпусе (sample_corpus=None).
-    """
+    """Перебор вариантов BM25 и печать Recall@50."""
     items = load_items(cfg)
-    if sample_corpus:
+    if sample_corpus is not None:
         items = subsample_corpus(items, validation, sample_corpus)
+        print(f"Корпус подвыбран до {len(items)} объявлений")
 
-    # ВАЖНО: метрику считаем только по оцениваемым запросам (queries),
-    # иначе mean делится на все запросы валидации и занижается при --limit
-    queries = validation.head(limit) if limit else validation
-    relevance = validation_relevance(queries)
-    k = cfg["recall"]["k"]
+    print("\n== BM25 (перебор вариантов, Recall@50) ==")
+    best_name, best_r = None, None
+    for name, use_desc, tw, cat_b, loc_b, pool in BM25_VARIANTS:
+        cfg["bm25"]["use_description"] = use_desc
+        cfg["bm25"]["title_weight"] = tw
+        cfg["bm25"]["category_boost"] = cat_b
+        cfg["bm25"]["location_boost"] = loc_b
+        cfg["bm25"]["boost_pool"] = pool
 
-    qid_to_tokens = {
-        row.query_id: lemmatize_query(row.search_query, row.search_infm_params_text)
-        for row in queries.itertuples()
-    }
-
-    print("\n== BM25: Recall@50 по вариантам ==")
-    print(f"{'вариант':38s} {'Recall@50':>10s}")
-    import gc
-
-    # Индексы строим ПО ОДНОМУ и освобождаем после варианта — BM25Okapi
-    # на полном корпусе держит в памяти ~гигабайты, кэш двух индексов = OOM
-    built_keys: set[tuple[bool, int]] = set()
-    for vi, (name, use_desc, tw, cat_b, loc_b, pool) in enumerate(BM25_VARIANTS):
-        key = (use_desc, tw)
-        if key not in built_keys:
-            retriever = build_bm25(
-                items,
-                {"use_description": use_desc, "title_weight": tw, "use_params": True},
-            )
-            built_keys.add(key)
-        # NB: индекс одного key переиспользуется подряд идущими вариантами
-
-        predictions: dict[str, list[str]] = {}
-        for row in tqdm(queries.itertuples(), total=len(queries), desc=name, leave=False):
-            tokens = qid_to_tokens[row.query_id]
-            if cat_b > 0 or loc_b > 0:
-                predictions[row.query_id] = apply_metadata_boosts(
-                    retriever,
-                    tokens,
-                    items,
-                    top_k=k,
-                    search_category=row.search_category,
-                    search_location_id=row.search_location_id,
-                    category_boost=cat_b,
-                    location_boost=loc_b,
-                    pool=pool,
-                )
-            else:
-                predictions[row.query_id] = [
-                    h.doc_id for h in retriever.search_tokens(tokens, top_k=k)
-                ]
-
-        score = mean_recall_at_k(predictions, relevance, k=k)
-        print(f"{name:38s} {score:>10.4f}", flush=True)
-
-        # Освобождаем индекс, если следующий вариант использует другой корпус
-        next_vi = vi + 1
-        if next_vi >= len(BM25_VARIANTS) or (
-            BM25_VARIANTS[next_vi][1],
-            BM25_VARIANTS[next_vi][2],
-        ) != key:
-            del retriever
-            built_keys.clear()
-            gc.collect()
+        retriever = build_bm25(items, cfg["bm25"])
+        preds = {row.query_id: [h.doc_id for h in retriever.search_tokens(
+            lemmatize_query(row.search_query, row.search_infm_params_text),
+            top_k=50,
+        )] for row in tqdm(validation.itertuples(), desc=name, total=len(validation))}
+        rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
+        r = mean_recall_at_k(preds, rel, k=50)
+        print(f"  {name:45s}  Recall@50={r:.4f}")
+        if best_r is None or r > best_r:
+            best_name, best_r = name, r
+    print(f"\nЛучший BM25: {best_name}  Recall@50={best_r:.4f}")
 
 
-def _load_dense(cfg: dict):
+def evaluate_dense(cfg: dict, validation: pd.DataFrame, limit=None) -> None:
+    """Dense-оценка (опционально, нужен артефакт)."""
     from src.retrievers.retrieval import DenseRetriever
 
     index_path = artifacts_dir(cfg) / "dense" / "e5.index"
     if not index_path.exists():
-        sys.exit(
-            f"Индекс не найден: {index_path}\n"
-            "Сначала постройте его: python scripts/build_dense_index.py"
-        )
-    return DenseRetriever(
-        index_path=str(index_path),
-        model_name=cfg["dense"]["model_name"],
+        print(f"Индекс не найден: {index_path}; skipping dense.")
+        return
+    dense = DenseRetriever(str(index_path), model_name=cfg["dense"]["model_name"])
+    preds = {}
+    for row in tqdm(validation.itertuples(), desc="dense", total=len(validation)):
+        if limit and len(preds) >= limit:
+            break
+        ids, _ = dense.search(row.search_query, top_k=50)
+        preds[row.query_id] = ids
+    rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
+    r = mean_recall_at_k(preds, rel, k=50)
+    print(f"\n== Dense (Recall@50) ==\n  Recall@50={r:.4f}\n")
+
+
+def evaluate_xgb(
+    cfg: dict,
+    validation: pd.DataFrame,
+    limit=None,
+    *,
+    model_path=None,
+    categories_path=None,
+    depth=None,
+    dataset=None,
+    split="holdout",
+    ks=(50,),
+) -> None:
+    """XGBoost-реранкер: BM25+бусты -> топ-1000 -> XGBRanker -> топ-50."""
+    from src.rerank.inference import rerank_xgb
+    from src.rerank.xgb_features import load_categories
+
+    b = cfg["bm25"]
+    xcfg = cfg.get("xgb_rerank", {})
+    model_path = model_path or str(PROJECT_ROOT / xcfg.get("model", "artifacts/xgb_rerank/model.json"))
+    categories_path = categories_path or str(PROJECT_ROOT / xcfg.get("categories", "artifacts/xgb_rerank/cat_categories.json"))
+    depth = depth or int(xcfg.get("depth", 1000))
+
+    if dataset:
+        from pathlib import Path as _Path
+        ds_path = PROJECT_ROOT / dataset
+        if not ds_path.exists():
+            print(f"Датасет не найден: {ds_path}")
+            return
+        ds = pd.read_parquet(ds_path)
+        if split == "holdout":
+            ds = ds[ds["split"] == "holdout"]
+        validation = ds
+        print(f"Используем датасет как валидацию: {dataset} (split={split}, {len(validation)} запросов)")
+
+    if limit:
+        validation = validation.head(limit)
+
+    predictions = rerank_xgb(
+        cfg, validation,
+        model_path=model_path,
+        categories_path=categories_path,
+        depth=depth,
+        show_progress=True,
     )
 
-
-def evaluate_dense(cfg: dict, validation: pd.DataFrame, limit: int | None) -> None:
-    dense = _load_dense(cfg)
-    queries = validation.head(limit) if limit else validation
-    relevance = validation_relevance(queries)
-    k = cfg["recall"]["k"]
-
-    predictions = {}
-    for row in tqdm(queries.itertuples(), total=len(queries), desc="dense"):
-        # Dense-модель работает на сыром тексте: запрос + фильтры
-        query = " ".join(
-            x for x in [row.search_query, str(row.search_infm_params_text)] if x
-        )
-        predictions[row.query_id] = [h.doc_id for h in dense.search(query, top_k=k)]
-
-    print(f"\n== Dense: Recall@50 = {mean_recall_at_k(predictions, relevance, k=k):.4f}")
+    rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
+    results = []
+    for k in ks:
+        r = mean_recall_at_k(predictions, rel, k=k)
+        results.append((k, r))
+        print(f"  Recall@{k:<4}={' '*4}{r:.4f}")
+    return results
 
 
-def evaluate_hybrid(cfg: dict, validation: pd.DataFrame, limit: int | None) -> None:
-    from src.retrievers.retrieval import HybridRetriever
+def evaluate_hybrid(cfg: dict, validation: pd.DataFrame, limit=None) -> None:
+    """Hybrid: BM25 + dense (RRF)."""
+    from src.retrievers.retrieval import DenseRetriever
 
     items = load_items(cfg)
-    dense = _load_dense(cfg)
-    bm25 = build_bm25(items, cfg["bm25"])
-    hybrid = HybridRetriever(
-        bm25=bm25,
-        dense=dense,
-        rrf_k=cfg["hybrid"]["rrf_k"],
-        dense_weight=cfg["hybrid"]["dense_weight"],
-    )
+    bm25_cfg = cfg["bm25"]
+    retriever = build_bm25(items, bm25_cfg)
 
-    queries = validation.head(limit) if limit else validation
-    relevance = validation_relevance(queries)
-    k = cfg["recall"]["k"]
-    cpr = cfg["hybrid"]["candidates_per_retriever"]
+    index_path = artifacts_dir(cfg) / "dense" / "e5.index"
+    if not index_path.exists():
+        print(f"Индекс не найден: {index_path}; skipping hybrid.")
+        return
+    dense = DenseRetriever(str(index_path), model_name=cfg["dense"]["model_name"])
 
-    predictions = {}
-    for row in tqdm(queries.itertuples(), total=len(queries), desc="hybrid"):
-        query = " ".join(
-            x for x in [row.search_query, str(row.search_infm_params_text)] if x
-        )
+    rrf_k = cfg.get("hybrid", {}).get("rrf_k", 60)
+    candidates = cfg.get("hybrid", {}).get("candidates_per_retriever", 100)
+    preds = {}
+    for row in tqdm(validation.itertuples(), desc="hybrid", total=len(validation)):
         tokens = lemmatize_query(row.search_query, row.search_infm_params_text)
-        predictions[row.query_id] = [
-            h.doc_id
-            for h in hybrid.search(
-                query, top_k=k, candidates_per_retriever=cpr, query_tokens=tokens
-            )
-        ]
+        bm25_hits = retriever.search_tokens(tokens, top_k=candidates)
+        dense_hits, _ = dense.search(row.search_query, top_k=candidates)
 
-    print(f"\n== Hybrid: Recall@50 = {mean_recall_at_k(predictions, relevance, k=k):.4f}")
+        scores = {}
+        for rank, h in enumerate(bm25_hits, 1):
+            scores.setdefault(h.doc_id, 0.0)
+            scores[h.doc_id] += 1.0 / (rrf_k + rank)
+        for rank, hid in enumerate(dense_hits, 1):
+            scores.setdefault(hid, 0.0)
+            scores[hid] += 1.0 / (rrf_k + rank)
 
-    # Дополнительно: BM25-only на тех же запросах — бенчмарк для сравнения вклада dense
-    bm25_only = {}
-    for row in queries.itertuples():
-        tokens = lemmatize_query(row.search_query, row.search_infm_params_text)
-        bm25_only[row.query_id] = [
-            h.doc_id for h in bm25.search_tokens(tokens, top_k=k)
-        ]
-    print(f"   (BM25-only на тех же запросах: {mean_recall_at_k(bm25_only, relevance, k=k):.4f})")
+        top = sorted(scores, key=scores.get, reverse=True)[:50]
+        preds[row.query_id] = top
+
+    rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
+    r = mean_recall_at_k(preds, rel, k=50)
+    print(f"\n== Hybrid (Recall@50) ==\n  Recall@50={r:.4f}\n")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", choices=["bm25", "dense", "hybrid"], required=True)
-    parser.add_argument("--limit", type=int, default=None, help="число запросов валидации")
-    parser.add_argument(
-        "--sample-corpus",
-        type=int,
-        default=None,
-        help="оценить на подвыборке корпуса из N объявлений (анти-OOM режим; "
-        "релевантные items всегда включаются). Финальные цифры — без флага.",
+def _parse_ks(k, cfg):
+    if k is None:
+        return (int(cfg.get("recall", {}).get("k", 50)),)
+    return tuple(int(x) for x in k.replace(",", " ").split())
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Оценка Recall@k на локальной валидации."
     )
+    parser.add_argument("--method", choices=["bm25", "dense", "xgb", "hybrid"],
+                        default="bm25")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="число валидационных запросов (bm25/dense/hybrid)")
+    parser.add_argument("--sample-corpus", type=int, default=None,
+                        help="оценить BM25 на подвыборке корпуса из N объявлений (анти-OOM режим; "
+                             "релевантные items всегда включаются). Финальные цифры — без флага.")
+    parser.add_argument("--model", default=None,
+                        help="model.json XGBRanker (методы xgb)")
+    parser.add_argument("--categories", default=None,
+                        help="cat_categories.json (методы xgb)")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="глубина переранжированного пула (методы xgb)")
+    parser.add_argument("--dataset", default=None,
+                        help="датасет реранкера для честной оценки без утечки "
+                             "(методы xgb; напр. artifacts/xgb_rerank/dataset_resampled.parquet)")
+    parser.add_argument("--k", default=None,
+                        help="k для Recall@k через запятую/пробел (методы xgb; "
+                             "по умолчанию cfg.recall.k=50). Пример: --k 50,100,150")
+    parser.add_argument("--split", default="holdout",
+                        help="сплит датасета для --dataset: holdout/eval/train "
+                             "(методы xgb; holdout — сессии, не участвовавшие в обучении)")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
     args = parser.parse_args()
 
@@ -251,6 +266,11 @@ def main() -> None:
         evaluate_bm25(cfg, validation, args.limit, sample_corpus=args.sample_corpus)
     elif args.method == "dense":
         evaluate_dense(cfg, validation, args.limit)
+    elif args.method == "xgb":
+        evaluate_xgb(cfg, validation, args.limit, model_path=args.model,
+                     categories_path=args.categories, depth=args.depth,
+                     dataset=args.dataset, split=args.split,
+                     ks=_parse_ks(args.k, cfg))
     else:
         evaluate_hybrid(cfg, validation, args.limit)
 
