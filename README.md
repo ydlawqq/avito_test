@@ -154,7 +154,7 @@ BM25 оценивался отдельно, метрикой Recall@k, снач�
 winget install ezwinports.make
 ```
 
-
+Перед началом необходимо загрузить файлы из исходного архива в папку raw_data/
 ```bash
 clone https://github.com/ydlawqq/avito_test.git
 
@@ -169,7 +169,7 @@ pip install -r requirements.txt
 make test
 
 Обучение с нуля 
-make train
+make train # готовит фичи, датасет, запускает обучение (у меня на все ушло ~2ч) 
 
 #Получение ответа
 make answer                         # -> answer/answer.csv
