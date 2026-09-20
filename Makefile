@@ -5,7 +5,7 @@
 
 PYTHON := .venv/bin/python
 ifeq ($(wildcard $(PYTHON)),)
-PYTHON := python3
+PYTHON := python
 endif
 
 .DEFAULT_GOAL := test
