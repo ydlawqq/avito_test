@@ -2,8 +2,6 @@
 
 Запуск:
     python scripts/evaluate.py --method bm25   [--limit 500]   # CPU, быстро
-    python scripts/evaluate.py --method dense  [--limit 500]   # нужен artifacts/dense/e5.index
-    python scripts/evaluate.py --method hybrid [--limit 500]
     python scripts/evaluate.py --method xgb    [--limit 500]   # XGBoost-реранкер
 
 bm25: перебирает варианты конфигурации (описание on/off, вес заголовка,
@@ -13,8 +11,8 @@ bm25: перебирает варианты конфигурации (описа
 Валидация построена из train.parquet: только запросы, чьи релевантные
 объявления есть в корпусе benchmark_items.parquet (см. src/evaluation/validation.py).
 
-xgb: оценка XGBoost-реранкера (BM25 с бустами -> топ-1000 -> XGBRanker ->
-топ-50) ровно тем же кодом, что scripts/make_answer.py --method xgb (см.
+xgb: оценка XGBoost-реранкера (BM25 с бустами -> топ-2000 -> XGBRanker ->
+топ-50) ровно тем же кодом, что scripts/make_answer.py (см.
 src/rerank/inference.py), поэтому метрика соответствует формируемому ответу.
 По умолчанию считается на validation.parquet: если модель обучалась на датасете,
 куда эти сессии вошли в train-часть (artifacts/xgb_rerank/dataset*.parquet),
@@ -111,25 +109,6 @@ def evaluate_bm25(
     print(f"\nЛучший BM25: {best_name}  Recall@50={best_r:.4f}")
 
 
-def evaluate_dense(cfg: dict, validation: pd.DataFrame, limit=None) -> None:
-    """Dense-оценка (опционально, нужен артефакт)."""
-    from src.retrievers.retrieval import DenseRetriever
-
-    index_path = artifacts_dir(cfg) / "dense" / "e5.index"
-    if not index_path.exists():
-        print(f"Индекс не найден: {index_path}; skipping dense.")
-        return
-    dense = DenseRetriever(str(index_path), model_name=cfg["dense"]["model_name"])
-    preds = {}
-    for row in tqdm(validation.itertuples(), desc="dense", total=len(validation)):
-        if limit and len(preds) >= limit:
-            break
-        ids, _ = dense.search(row.search_query, top_k=50)
-        preds[row.query_id] = ids
-    rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
-    r = mean_recall_at_k(preds, rel, k=50)
-    print(f"\n== Dense (Recall@50) ==\n  Recall@50={r:.4f}\n")
-
 
 def evaluate_xgb(
     cfg: dict,
@@ -185,44 +164,6 @@ def evaluate_xgb(
     return results
 
 
-def evaluate_hybrid(cfg: dict, validation: pd.DataFrame, limit=None) -> None:
-    """Hybrid: BM25 + dense (RRF)."""
-    from src.retrievers.retrieval import DenseRetriever
-
-    items = load_items(cfg)
-    bm25_cfg = cfg["bm25"]
-    retriever = build_bm25(items, bm25_cfg)
-
-    index_path = artifacts_dir(cfg) / "dense" / "e5.index"
-    if not index_path.exists():
-        print(f"Индекс не найден: {index_path}; skipping hybrid.")
-        return
-    dense = DenseRetriever(str(index_path), model_name=cfg["dense"]["model_name"])
-
-    rrf_k = cfg.get("hybrid", {}).get("rrf_k", 60)
-    candidates = cfg.get("hybrid", {}).get("candidates_per_retriever", 100)
-    preds = {}
-    for row in tqdm(validation.itertuples(), desc="hybrid", total=len(validation)):
-        tokens = lemmatize_query(row.search_query, row.search_infm_params_text)
-        bm25_hits = retriever.search_tokens(tokens, top_k=candidates)
-        dense_hits, _ = dense.search(row.search_query, top_k=candidates)
-
-        scores = {}
-        for rank, h in enumerate(bm25_hits, 1):
-            scores.setdefault(h.doc_id, 0.0)
-            scores[h.doc_id] += 1.0 / (rrf_k + rank)
-        for rank, hid in enumerate(dense_hits, 1):
-            scores.setdefault(hid, 0.0)
-            scores[hid] += 1.0 / (rrf_k + rank)
-
-        top = sorted(scores, key=scores.get, reverse=True)[:50]
-        preds[row.query_id] = top
-
-    rel = {row.query_id: set(row.relevant_items) for row in validation.itertuples()}
-    r = mean_recall_at_k(preds, rel, k=50)
-    print(f"\n== Hybrid (Recall@50) ==\n  Recall@50={r:.4f}\n")
-
-
 def _parse_ks(k, cfg):
     if k is None:
         return (int(cfg.get("recall", {}).get("k", 50)),)
@@ -233,10 +174,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Оценка Recall@k на локальной валидации."
     )
-    parser.add_argument("--method", choices=["bm25", "dense", "xgb", "hybrid"],
-                        default="bm25")
+    parser.add_argument("--method", choices=["bm25", "xgb"],
+                        default="xgb",
+                        help="xgb = production (BM25+бусты -> XGBRanker v2)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="число валидационных запросов (bm25/dense/hybrid)")
+                        help="число валидационных запросов (bm25/xgb)")
     parser.add_argument("--sample-corpus", type=int, default=None,
                         help="оценить BM25 на подвыборке корпуса из N объявлений (анти-OOM режим; "
                              "релевантные items всегда включаются). Финальные цифры — без флага.")
@@ -264,15 +206,11 @@ def main():
 
     if args.method == "bm25":
         evaluate_bm25(cfg, validation, args.limit, sample_corpus=args.sample_corpus)
-    elif args.method == "dense":
-        evaluate_dense(cfg, validation, args.limit)
-    elif args.method == "xgb":
+    else:  # xgb
         evaluate_xgb(cfg, validation, args.limit, model_path=args.model,
                      categories_path=args.categories, depth=args.depth,
                      dataset=args.dataset, split=args.split,
                      ks=_parse_ks(args.k, cfg))
-    else:
-        evaluate_hybrid(cfg, validation, args.limit)
 
 
 if __name__ == "__main__":

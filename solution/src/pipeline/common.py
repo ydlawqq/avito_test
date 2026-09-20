@@ -8,13 +8,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yaml
 
-from src.data.preprocessing import lemmatize_text
+from src.data.preprocessing import get_stopwords, lemmatize_text
 from src.retrievers.retrieval import BM25Retriever
 
 # Корень проекта (solution/src/pipeline/ -> ../../../..)
@@ -35,6 +36,34 @@ def artifacts_dir(cfg: dict) -> Path:
 def load_items(cfg: dict) -> pd.DataFrame:
     """Загрузить предобработанный корпус объявлений."""
     return pd.read_parquet(artifacts_dir(cfg) / "items_processed.parquet")
+
+
+def check_parquet(path: Path, what: str) -> None:
+    """Проверить, что файл есть и это parquet (magic-байты ``PAR1`` в начале и в конце).
+
+    Большие parquet (items_processed.parquet ~297 МБ) часто обрезаются при
+    копировании между машинами: pandas/pyarrow падают с невнятным «Parquet magic
+    bytes not found in footer. Either the file is corrupted or this is not a
+    parquet file» и вместо пути печатают ``<Buffer>``. Проверка даёт понятную
+    ошибку с именем файла и размером до тяжёлой работы.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{what} не найден: {path}")
+    size = path.stat().st_size
+    if size < 8:
+        raise ValueError(f"{what} повреждён: {path} — файл пуст или обрезан ({size} байт)")
+    with open(path, "rb") as f:
+        head = f.read(4)
+        f.seek(-4, os.SEEK_END)
+        tail = f.read(4)
+    if head != b"PAR1" or tail != b"PAR1":
+        raise ValueError(
+            f"{what} повреждён: {path} ({size} байт, head={head!r}, tail={tail!r}). "
+            "Ожидается parquet ('PAR1' ... 'PAR1') — скорее всего файл обрезался при "
+            "копировании. Перекопируйте файл целиком или пересоберите артефакты: "
+            "python scripts/prepare_data.py."
+        )
+    print(f"{what}: {path} ({size} байт) — parquet OK")
 
 
 def build_doc_tokens(
@@ -94,6 +123,9 @@ def build_bm25(
     k1 = cfg_bm25.get("k1")
     if k1 is not None:
         retriever.bm25.k1 = float(k1)
+    b = cfg_bm25.get("b")
+    if b is not None:
+        retriever.bm25.b = float(b)
     return retriever
 
 
@@ -111,6 +143,28 @@ def lemmatize_query(
         # Параметры фильтра («Вид услуги ...») добавляем без веса
         tokens.extend(lemmatize_text(str(infm_params), sw))
     return tokens
+
+
+class QueryLemmatizer:
+    """Лемматизация запроса с кэшем.
+
+    Один и тот же search_query / infm_params повторяется в трейне десятки раз,
+    а lemmatize_query — чистый Python + pymorphy3, поэтому кэш экономит время.
+    Используется пакетными скриптами (solution/xgb_rerank/*), на инференсе не нужен.
+    """
+
+    def __init__(self) -> None:
+        self._stopwords = get_stopwords()
+        self._cache: dict[tuple[str, str], list[str]] = {}
+
+    def __call__(self, search_query: str, infm_params: str = "") -> list[str]:
+        params = "" if infm_params is None else str(infm_params)
+        key = (str(search_query), params)
+        tokens = self._cache.get(key)
+        if tokens is None:
+            tokens = lemmatize_query(key[0], params, self._stopwords)
+            self._cache[key] = tokens
+        return tokens
 
 
 def apply_metadata_boosts(
@@ -165,7 +219,9 @@ def apply_metadata_boosts(
         mult *= 1.0 + location_boost * (loc == search_location_id)
 
     boosted = scores[idx] * mult
-    order = np.argsort(-boosted)[:top_k]
+    # kind="stable": при равных скорах порядок определяется положением в пуле —
+    # результат воспроизводим бит в бит (гарантия детерминизма ответа).
+    order = np.argsort(-boosted, kind="stable")[:top_k]
     result = [retriever.doc_ids[int(i)] for i in idx[order]]
 
     if fill_to_top_k and len(result) < top_k:
@@ -209,7 +265,7 @@ def _fill_with_zero_score(
         mult_all *= 1.0 + location_boost * (locs == search_location_id)
 
     seen = set(result)
-    for i in np.argsort(-(scores * mult_all)):
+    for i in np.argsort(-(scores * mult_all), kind="stable"):
         doc_id = retriever.doc_ids[int(i)]
         if doc_id in seen:
             continue

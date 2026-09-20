@@ -1,12 +1,7 @@
-"""Ретриверы для candidate generation: BM25, dense (faiss) и гибридный (RRF).
+"""Retriever для candidate generation: BM25 (rank_bm25).
 
-Все ретриверы возвращают одинаковый интерфейс — список RetrievedDoc,
-поэтому их можно свободно комбинировать (см. HybridRetriever).
-
-Используемые open-source библиотеки / модели:
+Используемые open-source библиотеки:
   * rank_bm25 (BM25Okapi)        — лексический поиск
-  * faiss (IndexIDMap + FlatIP)  — поиск по эмбеддингам
-  * sentence-transformers        — би-энкодер (по умолчанию multilingual-e5)
   * pymorphy3                    — лемматизация (см. src/data/preprocessing.py)
 """
 
@@ -17,55 +12,15 @@ from dataclasses import dataclass
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-try:  # опциональные зависимости dense-ретривера
-    import faiss
-
-    _HAS_FAISS = True
-except ImportError:  # pragma: no cover
-    _HAS_FAISS = False
-
-try:
-    from sentence_transformers import SentenceTransformer
-
-    _HAS_ST = True
-except ImportError:  # pragma: no cover
-    _HAS_ST = False
-
 
 @dataclass
 class RetrievedDoc:
     doc_id: str
     text: str
     score: float
-    source: str  # "bm25" / "dense" / "hybrid"
+    source: str  # "bm25"
     metadata: dict | None = None
 
-
-def reciprocal_rank_fusion(
-    rankings: list[list[str]],
-    k: int = 60,
-) -> list[tuple[str, float]]:
-    """Merge multiple ranked lists via RRF.
-
-    rrf_score(doc) = sum over rankings of 1 / (k + rank_in_ranking)
-
-    Args:
-        rankings: list of lists where each inner list is doc_ids ordered best-first
-        k: smoothing constant, default 60 (standard)
-
-    Returns:
-        list of (doc_id, fused_score) sorted by score descending
-    """
-    scores: dict[str, float] = {}
-    for ranking in rankings:
-        for rank, doc_id in enumerate(ranking, start=1):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-    return sorted(scores.items(), key=lambda x: -x[1])
-
-
-# ---------------------------------------------------------------------------
-# BM25
-# ---------------------------------------------------------------------------
 
 
 class BM25Retriever:
@@ -107,50 +62,22 @@ class BM25Retriever:
         """Скор BM25 для всех документов корпуса по токенам запроса."""
         return self.bm25.get_scores(tokens)
 
-    def top_indices(
-        self,
-        tokens: list[str],
-        top_k: int = 50,
-        allow_zero_score: bool = False,
-    ) -> list[int]:
-        """Индексы top-k документов по BM25.
-
-        allow_zero_score=False — отсекаем документы без общих с запросом лемм
-        (score == 0): лексически они нерелевантны.
-        allow_zero_score=True — добираем и нулевые скоры, чтобы вернуть ровно
-        top_k индексов: у редких/опечатанных запросов («сабутыльник»,
-        «видеоограф») ненулевых скоров меньше top_k, а ответ должен быть полным.
-        """
-        return self._top_indices(self.score_tokens(tokens), top_k, allow_zero_score)
-
-    @staticmethod
-    def _top_indices(
-        scores: np.ndarray,
-        top_k: int,
-        allow_zero_score: bool = False,
-    ) -> list[int]:
-        """Top-k индексов по готовому вектору скоров (сортировка по убыванию)."""
-        n_take = min(len(scores), max(0, top_k))
-        if n_take == 0:
-            return []
-        # argpartition — O(N) вместо полного argsort на 190k документов
-        top = np.argpartition(-scores, n_take - 1)[:n_take]
-        top = top[np.argsort(-scores[top])]
-        if allow_zero_score:
-            return [int(i) for i in top]
+    def top_indices(self, tokens: list[str], top_k: int = 50) -> list[int]:
+        """Индексы top-k документов по BM25 (score > 0)."""
+        scores = self.score_tokens(tokens)
+        # kind="stable": при равных скорах порядок задается индексом корпуса —
+        # результат не зависит от версии numpy (гарантия детерминизма).
+        top = np.argsort(-scores, kind="stable")[:top_k]
         return [int(i) for i in top if scores[i] > 0]
 
     def search_tokens(
         self,
         tokens: list[str],
         top_k: int = 50,
-        allow_zero_score: bool = False,
     ) -> list[RetrievedDoc]:
         """Поиск по предобработанному (лемматизированному) запросу."""
-        # get_scores считается один раз: вызов top_indices + повторный
-        # score_tokens удваивал бы проход по всему корпусу на каждый запрос
-        scores = self.score_tokens(tokens)
-        idx = self._top_indices(scores, top_k, allow_zero_score)
+        idx = self.top_indices(tokens, top_k)
+        scores = self.bm25.get_scores(tokens)
         return [
             RetrievedDoc(
                 doc_id=self.doc_ids[i],
@@ -168,151 +95,3 @@ class BM25Retriever:
         В основном пайплайне используйте search_tokens — с лемматизацией метрика выше.
         """
         return self.search_tokens(query.lower().split(), top_k=top_k)
-
-
-
-# ---------------------------------------------------------------------------
-# Dense retrieval (faiss)
-# ---------------------------------------------------------------------------
-
-
-class DenseRetriever:
-    """Dense retrieval: sentence-transformers би-энкодер + faiss-индекс.
-
-    Индекс строится скриптом scripts/build_dense_index.py (GPU-машина) и
-    хранится в artifacts/dense/. Чанкование — см. build_dense_index.py:
-    на каждый item приходится 1..max_chunks чанков, при поиске чанки одного
-    item схлопываются по максимальному скору.
-
-    Модель по умолчанию — intfloat/multilingual-e5-large: сильный open-source
-    би-энкодер для русского языка. E5 требует префиксов "query: "/"passage: ".
-    """
-
-    def __init__(
-        self,
-        index_path: str,
-        model_name: str = "intfloat/multilingual-e5-large",
-        device: str | None = None,
-        query_prefix: str = "query: ",
-    ):
-        if not (_HAS_FAISS and _HAS_ST):
-            raise ImportError(
-                "Для DenseRetriever необходимы faiss и sentence-transformers: "
-                "pip install faiss-cpu sentence-transformers"
-            )
-        import pathlib
-
-        self.index = faiss.read_index(index_path)
-        self.encoder = SentenceTransformer(model_name, device=device)
-        self.query_prefix = query_prefix
-
-        # Маппинг внутренний id чанка -> item_id лежит рядом с индексом
-        mapping_path = pathlib.Path(index_path).with_name("chunk_item_ids.npy")
-        self.chunk_item_ids: np.ndarray = np.load(mapping_path)  # type: ignore[assignment]
-        self.item_ids: list[str] = self.chunk_item_ids.tolist()
-
-    def embed_query(self, query: str) -> np.ndarray:
-        # e5-модели ожидают префиксы "query: " / "passage: " для лучшего качества
-        return self.encoder.encode(
-            [f"{self.query_prefix}{query}"], normalize_embeddings=True
-        )[0]
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 50,
-        oversample: int = 4,
-    ) -> list[RetrievedDoc]:
-        """Вернуть top_k уникальных item_id.
-
-        oversample: чанков одного item несколько — достаём top_k*oversample
-        чанков и схлопываем их по максимальному скору item'а.
-        """
-        vector = self.embed_query(query)
-        scores, ids = self.index.search(
-            vector.reshape(1, -1).astype("float32"), top_k * oversample
-        )
-
-        best: dict[str, float] = {}
-        for score, chunk_id in zip(scores[0], ids[0]):
-            if chunk_id == -1:
-                continue
-            item_id = self.item_ids[chunk_id]
-            best[item_id] = max(best.get(item_id, -np.inf), float(score))
-
-        ranked = sorted(best.items(), key=lambda x: -x[1])[:top_k]
-        return [
-            RetrievedDoc(doc_id=i, text="", score=s, source="dense")
-            for i, s in ranked
-        ]
-
-
-# ---------------------------------------------------------------------------
-# Hybrid: BM25 + Dense через RRF
-# ---------------------------------------------------------------------------
-
-
-class HybridRetriever:
-    """BM25 + dense, объединённые через Reciprocal Rank Fusion.
-
-    RRF не требует нормализации сырых скоров (BM25-скор и косинусная близость
-    несравнимы между собой), хорошо работает на практике и максимизирует
-    полноту — именно то, что нужно для Recall@50.
-    """
-
-    def __init__(
-        self,
-        bm25: BM25Retriever,
-        dense: DenseRetriever | None,
-        rrf_k: int = 60,
-        dense_weight: float = 1.0,
-    ):
-        self.bm25 = bm25
-        self.dense = dense
-        self.rrf_k = rrf_k
-        # Вес dense-ранжирования в RRF: 1/(k+r) умножается на dense_weight
-        self.dense_weight = dense_weight
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 50,
-        candidates_per_retriever: int = 100,
-        query_tokens: list[str] | None = None,
-    ) -> list[RetrievedDoc]:
-        """query_tokens — лемматизированный запрос для BM25; query — сырой текст для dense."""
-        bm25_hits = self.bm25.search_tokens(
-            query_tokens if query_tokens is not None else query.lower().split(),
-            top_k=candidates_per_retriever,
-        )
-
-        rankings = [[h.doc_id for h in bm25_hits]]
-        docs = {h.doc_id: h for h in bm25_hits}
-
-        if self.dense is not None:
-            dense_hits = self.dense.search(query, top_k=candidates_per_retriever)
-            rankings.append([h.doc_id for h in dense_hits])
-            for h in dense_hits:
-                docs.setdefault(h.doc_id, h)
-
-        # Взвешенный RRF: вклад dense-ранжирования масштабируется на dense_weight
-        scores: dict[str, float] = {}
-        weights = [1.0, self.dense_weight]
-        for weight, ranking in zip(weights[: len(rankings)], rankings):
-            for rank, doc_id in enumerate(ranking, start=1):
-                scores[doc_id] = scores.get(doc_id, 0.0) + weight / (self.rrf_k + rank)
-        fused = sorted(scores.items(), key=lambda x: -x[1])
-
-        results = []
-        for doc_id, fused_score in fused[:top_k]:
-            base = docs.get(doc_id)
-            results.append(
-                RetrievedDoc(
-                    doc_id=doc_id,
-                    text=base.text if base else "",
-                    score=fused_score,
-                    source="hybrid",
-                    metadata=base.metadata if base else None,
-                )
-            )
-        return results

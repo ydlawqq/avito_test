@@ -1,16 +1,7 @@
-# Ретриверы: BM25, dense (faiss), гибридный (RRF)
-from .retrieval import (
-    BM25Retriever,
-    DenseRetriever,
-    HybridRetriever,
-    RetrievedDoc,
-    reciprocal_rank_fusion,
-)
+"""Retriever: BM25 (candidate generation для XGB-реранкера)."""
+from .retrieval import BM25Retriever, RetrievedDoc
 
 __all__ = [
     "BM25Retriever",
-    "DenseRetriever",
-    "HybridRetriever",
     "RetrievedDoc",
-    "reciprocal_rank_fusion",
 ]

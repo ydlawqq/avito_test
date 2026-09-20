@@ -1,6 +1,5 @@
 # =====================================================================
-# Candidate Generation — зависимости проекта (Python 3.12)
-# PyTorch ставится отдельно CPU-сборкой с https://download.pytorch.org/whl/cpu
+# Production-пайплайн: BM25 candidate generation + XGBoost reranker (v2)
 # =====================================================================
 
 # Числовые библиотеки / данные
@@ -8,12 +7,8 @@ numpy>=1.26,<3
 pandas>=2.2
 pyarrow>=17.0
 
-# Deep Learning
-transformers>=4.46
-sentence-transformers>=3.3
-
-# ANN index (поиск кандидатов)
-faiss-cpu>=1.9
+# XGBoost-реранкер
+xgboost>=2.0
 
 # Утилиты
 tqdm>=4.66
@@ -25,5 +20,5 @@ pymorphy3>=2.0
 # BM25-поиск
 rank_bm25>=0.2.2
 
-# Стоп-слова для российской лемматизации / BM25
+# Стоп-слова для русской лемматизации / BM25
 nltk>=3.8

@@ -1,4 +1,3 @@
-# Конфиг пайплайна candidate generation. Все скрипты в scripts/ читают его.
 
 paths:
   raw_data_dir: raw_data
@@ -15,26 +14,16 @@ bm25:
   use_params: true             # включать ли item_infm_params_text
   category_boost: 0.0          # множитель (1 + boost) при совпадении категории
                                # (бесполезен: 99% корпуса — категория 114)
+  category_filter: true        # жёстко искать только в категории запроса (до бустов):
+                               # категория item == категория запроса в 497620/497673
+                               # пар train (99.989%); если категории запроса нет в
+                               # корпусе (search_category=0), фильтр не применяется
   location_boost: 2.0          # множитель (1 + boost) при совпадении локации;
                                # 83% релевантных items — в локации поиска
   boost_pool: 5000             # размер сырого BM25-пула для бустов (главный фактор)
-  k1: 1.5
+  k1: 0.9                      # сетка эксперимента pool_recall: 0.9 оптимален
+  b: 0.3                       # был неявный дефолт rank_bm25 (0.75); сетка: 0.3 оптимален
   epsilon: 0.75
-
-dense:
-  model_name: intfloat/multilingual-e5-large
-  query_prefix: "query: "
-  passage_prefix: "passage: "
-  chunk_words: 200             # размер чанка описания в словах
-  chunk_overlap: 50            # перекрытие между чанками
-  max_chunks_per_item: 3       # 1 чанк title+params + 2 чанка описания
-  batch_size: 256
-  max_length: 512
-
-hybrid:
-  rrf_k: 60
-  candidates_per_retriever: 100
-  dense_weight: 1.0
 
 validation:
   seed: 42
@@ -42,3 +31,41 @@ validation:
 
 recall:
   k: 50
+
+xgb_rerank:
+  depth: 2000          # размер переранжированного BM25-пула, который переранжирует
+                       # модель (сырой пул bm25.boost_pool=5000 -> бусты -> топ-2000);
+                       # 2000 вместо 1000: +0.4-0.7 п.п. Recall@50, 5000 не даёт доп. выигрыша
+  model: artifacts/xgb_rerank/model_v2.json
+  categories: artifacts/xgb_rerank/cat_categories_v2.json
+  pair_stats: artifacts/xgb_rerank/pair_stats
+
+# Параметры полного переобучения (scripts/train_model.py). Итоговая модель
+# пишется в *_retrain.json — production model_v2.json не затирается; после
+# проверки holdout-метрики поменяйте xgb_rerank.model/categories выше.
+train:
+  seed: 42
+  train_frac: 0.7          # доля сессий train-сплита при сборке датасета
+  neg_frac: 0.0            # 0: в train-сплите оставляем только голову пула
+                           # (топ-50), полные пулы eval-сессий переиспользует
+                           # resample — так была обучена model_v2
+  build_depth: 1000        # глубина пулов при сборке датасета (как в v2)
+  augment_chunk_rows: 1000000
+  xgb:
+    iterations: 2000       # максимум деревьев (реальное задаёт early stopping)
+    max_depth: 6           # model_v2 обучена с depth=6
+    eta: 0.05
+    early_stopping: 100
+    subsample: 0.9
+    colsample: 0.8
+    objective: rank:ndcg
+  outputs:
+    pair_stats: artifacts/xgb_rerank/pair_stats
+    dataset: artifacts/xgb_rerank/dataset.parquet
+    dataset_v2: artifacts/xgb_rerank/dataset_v2.parquet
+    dataset_resampled: artifacts/xgb_rerank/dataset_resampled_v2.parquet
+    model: artifacts/xgb_rerank/model_retrain.json
+    categories: artifacts/xgb_rerank/cat_categories_retrain.json
+                       
+
+

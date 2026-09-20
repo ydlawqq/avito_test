@@ -7,7 +7,7 @@
     items_processed.parquet — корпус с лемматизированными полями:
         item_id, item_category_id, item_microcat_id, item_location_id,
         title_lem / params_lem / desc_lem  (list[str] лемм),
-        title_raw / params_raw / desc_raw  (сырой текст для dense-чанков)
+        title_raw / params_raw / desc_raw  (сырой текст объявлений)
     validation.parquet — локальная валидация из train.parquet
         (query_id, признаки запроса, relevant_items)
 """

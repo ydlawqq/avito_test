@@ -12,8 +12,8 @@
 из BM25-скора и лемматизированных текстов.
 
 Один и тот же код используется:
-  * experiments/xgb_rerank/build_dataset.py  — формирование обучающего датасета;
-  * experiments/xgb_rerank/train_xgb_reranker.py — обучение XGBRanker;
+  * solution/xgb_rerank/build_dataset.py  — формирование обучающего датасета;
+  * solution/xgb_rerank/train_xgb_reranker.py — обучение XGBRanker;
   * scripts/make_answer.py --method xgb      — инференс на benchmark-запросах.
 """
 
@@ -78,7 +78,9 @@ NUMERIC_FEATURES: list[str] = [
     "microcat_pos_freq", # доля позитивов train-split с этим microcat
     "loc_microcat_freq", # count(S, microcat)/count(S)
     "qtext_microcat_freq",  # count(text, microcat)/count(text); текста нет -> NaN
-    "qtext_item_cnt_log",   # log1p(count(text, item))
+    "qtext_item_cnt_log",  # log1p(count(text, item)) из train-позитивов; текста
+                           # нет -> 0. Признак model_v2 (обязателен для инференса;
+                           # считается по artifacts/xgb_rerank/pair_stats)
     # --- v2: уточнение текстовых пересечений ---
     "title_jaccard",     # |q∩t| / (|q|+|t|-|q∩t|) по МНОЖЕСТВАМ лемм
     "params_jaccard",    # |q∩p| / (|q|+|p|-|q∩p|)
@@ -108,7 +110,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 # --------------------------------------------------------------------------
-# PairStats — таблицы парной статистики (experiments/xgb_rerank/pair_stats.py).
+# PairStats — таблицы парной статистики (solution/xgb_rerank/pair_stats.py).
 # Глобальный синглтон: build_features берёт get_pair_stats(); если таблицы не
 # загружены, новые фичи заполняются NaN/нулями (обратная совместимость).
 # --------------------------------------------------------------------------
@@ -508,12 +510,12 @@ def build_features(
         X2[:, V2_COLUMNS.index("loc_microcat_freq")] = lmf
 
         # ---- v2: статистики по тексту запроса ----
-        qmf, qic = ps.qtext_stats(
+        qmf, qic_log = ps.qtext_stats(
             str(qrow.search_query), item_index.micro[corpus_idx],
             item_index.doc_ids[corpus_idx],
         )
         X2[:, V2_COLUMNS.index("qtext_microcat_freq")] = qmf
-        X2[:, V2_COLUMNS.index("qtext_item_cnt_log")] = qic
+        X2[:, V2_COLUMNS.index("qtext_item_cnt_log")] = qic_log
 
     # ---- v2: уточнённые текстовые пересечения (по МНОЖЕСТВАМ лемм) ----
     params_raw = str(qrow.search_infm_params_text or "")

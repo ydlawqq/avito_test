@@ -92,9 +92,19 @@ def _load_stage1(cfg: dict, model_path: str, categories_path: str):
 
     model = xgb.XGBRanker()
     model.load_model(model_path)
+    # Фичи, на которых модель обучалась (порядок важен). Абляционные модели
+    # (например v4_abl без статистических фич) обучены на подмножестве
+    # NUMERIC_FEATURES — на инференсе фрейм признаков выравнивается по этому
+    # списку в _stage1_scores, иначе XGBoost падает с feature_names mismatch.
+    booster = model.get_booster()
+    model._expected_features = (
+        list(booster.feature_names) if booster.feature_names else None
+    )
     categories = load_categories(categories_path)
     print(f"XGBRanker загружен: {model_path} | категорий: "
-          f"{ {k: len(v) for k, v in categories.items()} }")
+          f"{ {k: len(v) for k, v in categories.items()} }"
+          + (f" | фич: {len(model._expected_features)}"
+             if model._expected_features else ""))
 
     items = prepare_item_side(cfg)
     item_index = ItemSideIndex(items)
@@ -140,7 +150,11 @@ def _stage1_scores(
     X_num, micro, search_loc = build_features(
         row, corpus_idx, raw_s, boost_s, raw_r, tokens, item_index,
     )
-    scores = model.predict(features_frame(X_num, micro, search_loc, categories))
+    frame = features_frame(X_num, micro, search_loc, categories)
+    expected = getattr(model, "_expected_features", None)
+    if expected:
+        frame = frame[expected]  # подмножество и порядок — как при обучении
+    scores = model.predict(frame)
     return corpus_idx, np.asarray(scores, dtype=np.float64).reshape(-1)
 
 
