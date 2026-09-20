@@ -165,14 +165,14 @@ cd avito_test
 
 pip install -r requirements.txt     
 
-# Проверка готовности
+#Проверка готовности
 make test
 
-Обучение с нуля 
-make train # готовит фичи, датасет, запускает обучение (у меня на все ушло ~2ч) 
+#Обучение с нуля 
+make train #готовит фичи, датасет, запускает обучение (у меня на все ушло ~2ч) 
 
 #Получение ответа
-make answer                         # -> answer/answer.csv
+make answer                         #-> answer/answer.csv
 ```
 
 
